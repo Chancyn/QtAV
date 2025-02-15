@@ -449,6 +449,7 @@ QVariantList AVPlayer::Private::getTracksInfo(AVDemuxer *demuxer, AVDemuxer::Str
     QVariantList info;
     if (!demuxer)
         return info;
+
     QList<int> streams;
     switch (st) {
     case AVDemuxer::AudioStream:
@@ -459,11 +460,14 @@ QVariantList AVPlayer::Private::getTracksInfo(AVDemuxer *demuxer, AVDemuxer::Str
         break;
     case AVDemuxer::VideoStream:
         streams = demuxer->videoStreams();
+        break;
     default:
         break;
     }
+
     if (streams.isEmpty())
         return info;
+
     foreach (int s, streams) {
         QVariantMap t;
         t[QStringLiteral("id")] = info.size();
@@ -471,31 +475,36 @@ QVariantList AVPlayer::Private::getTracksInfo(AVDemuxer *demuxer, AVDemuxer::Str
         t[QStringLiteral("stream_index")] = QVariant(s);
 
         AVStream *stream = demuxer->formatContext()->streams[s];
-        AVCodecContext *ctx = stream->codec;
-        if (ctx) {
-            const AVCodecDescriptor* codec_desc = avcodec_descriptor_get(ctx->codec_id);
-            if (codec_desc)
+        AVCodecParameters *codecpar = stream->codecpar;
+
+        if (codecpar) {
+            const AVCodecDescriptor* codec_desc = avcodec_descriptor_get(codecpar->codec_id);
+            if (codec_desc) {
                 t[QStringLiteral("codec")] = QByteArray(codec_desc->name);
-            else
+            } else {
                 continue;
-            if (ctx->extradata)
-                t[QStringLiteral("extra")] = QByteArray((const char*)ctx->extradata, ctx->extradata_size);
+            }
+
+            if (codecpar->extradata) {
+                t[QStringLiteral("extra")] = QByteArray((const char*)codecpar->extradata, codecpar->extradata_size);
+            }
         }
+
         AVDictionaryEntry *tag = av_dict_get(stream->metadata, "language", NULL, 0);
         if (!tag)
             tag = av_dict_get(stream->metadata, "lang", NULL, 0);
         if (tag) {
             t[QStringLiteral("language")] = QString::fromUtf8(tag->value);
         }
+
         tag = av_dict_get(stream->metadata, "title", NULL, 0);
         if (tag) {
             t[QStringLiteral("title")] = QString::fromUtf8(tag->value);
         }
+
         info.push_back(t);
     }
-    //QVariantMap t;
-    //t[QStringLiteral("id")] = -1;
-    //info.prepend(t);
+
     return info;
 }
 

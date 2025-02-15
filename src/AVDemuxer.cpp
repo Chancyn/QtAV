@@ -223,15 +223,35 @@ public:
             delete input;
             input = 0;
         }
+        if (astream.avctx) {
+            avcodec_free_context(&astream.avctx);
+        }
+        if (vstream.avctx) {
+            avcodec_free_context(&vstream.avctx);
+        }
+        if (sstream.avctx) {
+            avcodec_free_context(&sstream.avctx);
+        }
     }
     void applyOptionsForDict();
     void applyOptionsForContext();
     void resetStreams() {
         stream = -1;
-        if (media_changed)
+        if (astream.avctx) {
+            avcodec_free_context(&astream.avctx);
+        }
+        if (vstream.avctx) {
+            avcodec_free_context(&vstream.avctx);
+        }
+        if (sstream.avctx) {
+            avcodec_free_context(&sstream.avctx);
+        }
+        if (media_changed) {
             astream = vstream = sstream = StreamInfo();
-        else
+        }
+        else {
             astream.avctx = vstream.avctx = sstream.avctx = 0;
+        }
         audio_streams.clear();
         video_streams.clear();
         subtitle_streams.clear();
@@ -780,7 +800,7 @@ bool AVDemuxer::load()
             // avdevice://avfoundation:device_name
             s0 += 2;
         } // else avdevice:video4linux2:file_name
-        d->input_format = av_find_input_format(d->file.mid(s0, s1-s0).toUtf8().constData());
+        d->input_format = (AVInputFormat*)av_find_input_format(d->file.mid(s0, s1-s0).toUtf8().constData());
         d->file = d->file.mid(s1+1);
     }
 #endif
@@ -795,7 +815,7 @@ bool AVDemuxer::load()
     // check special dict keys
     // d->format_forced can be set from AVFormatContext.format_whitelist
     if (!d->format_forced.isEmpty()) {
-        d->input_format = av_find_input_format(d->format_forced.toUtf8().constData());
+        d->input_format = (AVInputFormat*)av_find_input_format(d->format_forced.toUtf8().constData());
         qDebug() << "force format: " << d->format_forced;
     }
     int ret = 0;
@@ -1077,34 +1097,73 @@ AVCodecContext* AVDemuxer::audioCodecContext(int stream) const
         return d->astream.avctx;
     if (stream > (int)d->format_ctx->nb_streams)
         return 0;
-    AVCodecContext *avctx = d->format_ctx->streams[stream]->codec;
-    if (avctx->codec_type == AVMEDIA_TYPE_AUDIO)
-        return avctx;
-    return 0;
+    
+    AVCodecParameters *codecpar = d->format_ctx->streams[stream]->codecpar;
+    if (codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
+        return nullptr;
+
+    AVCodecContext *avctx = avcodec_alloc_context3(NULL);
+    if (!avctx) {
+        return nullptr;
+    }
+
+    int ret = avcodec_parameters_to_context(avctx, codecpar);
+    if (ret < 0) {
+        avcodec_free_context(&avctx);
+        return nullptr;
+    }
+
+    return avctx;
 }
 
 AVCodecContext* AVDemuxer::videoCodecContext(int stream) const
 {
     if (stream < 0)
         return d->vstream.avctx;
-    if (stream > (int)d->format_ctx->nb_streams)
-        return 0;
-    AVCodecContext *avctx = d->format_ctx->streams[stream]->codec;
-    if (avctx->codec_type == AVMEDIA_TYPE_VIDEO)
-        return avctx;
-    return 0;
+    if (stream >= (int)d->format_ctx->nb_streams)
+        return nullptr;
+
+    AVCodecParameters *codecpar = d->format_ctx->streams[stream]->codecpar;
+    if (codecpar->codec_type != AVMEDIA_TYPE_VIDEO)
+        return nullptr;
+
+    AVCodecContext *avctx = avcodec_alloc_context3(NULL);
+    if (!avctx) {
+        return nullptr;
+    }
+
+    int ret = avcodec_parameters_to_context(avctx, codecpar);
+    if (ret < 0) {
+        avcodec_free_context(&avctx);
+        return nullptr;
+    }
+
+    return avctx;
 }
 
 AVCodecContext* AVDemuxer::subtitleCodecContext(int stream) const
 {
     if (stream < 0)
-        return d->sstream.avctx;
-    if (stream > (int)d->format_ctx->nb_streams)
-        return 0;
-    AVCodecContext *avctx = d->format_ctx->streams[stream]->codec;
-    if (avctx->codec_type == AVMEDIA_TYPE_SUBTITLE)
-        return avctx;
-    return 0;
+        return d->vstream.avctx;
+    if (stream >= (int)d->format_ctx->nb_streams)
+        return nullptr;
+
+    AVCodecParameters *codecpar = d->format_ctx->streams[stream]->codecpar;
+    if (codecpar->codec_type != AVMEDIA_TYPE_SUBTITLE)
+        return nullptr;
+
+    AVCodecContext *avctx = avcodec_alloc_context3(NULL);
+    if (!avctx) {
+        return nullptr;
+    }
+
+    int ret = avcodec_parameters_to_context(avctx, codecpar);
+    if (ret < 0) {
+        avcodec_free_context(&avctx);
+        return nullptr;
+    }
+
+    return avctx;
 }
 
 /**
@@ -1298,7 +1357,21 @@ bool AVDemuxer::Private::setStream(AVDemuxer::StreamType st, int streamValue)
     // don't touch wanted index
     si->stream = s;
     si->wanted_stream = streamValue;
-    si->avctx = format_ctx->streams[s]->codec;
+
+    si->avctx = avcodec_alloc_context3(nullptr);
+    if (!si->avctx) {
+        qWarning("Failed to allocate AVCodecContext");
+        return false;
+    }
+
+    AVCodecParameters *codecpar = format_ctx->streams[s]->codecpar;
+    int ret = avcodec_parameters_to_context(si->avctx, codecpar);
+    if (ret < 0) {
+        qWarning("Failed to copy codec parameters to context");
+        avcodec_free_context(&si->avctx);
+        return false;
+    }
+
     has_attached_pic = !!(format_ctx->streams[s]->disposition & AV_DISPOSITION_ATTACHED_PIC);
     return true;
 }
@@ -1311,7 +1384,7 @@ bool AVDemuxer::Private::prepareStreams()
         return false;
     AVMediaType type = AVMEDIA_TYPE_UNKNOWN;
     for (unsigned int i = 0; i < format_ctx->nb_streams; ++i) {
-        type = format_ctx->streams[i]->codec->codec_type;
+        type = format_ctx->streams[i]->codecpar->codec_type;
         if (type == AVMEDIA_TYPE_VIDEO) {
             video_streams.push_back(i);
         } else if (type == AVMEDIA_TYPE_AUDIO) {

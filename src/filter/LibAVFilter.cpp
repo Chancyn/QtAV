@@ -84,7 +84,7 @@ public:
         filter_graph = 0;
         in_filter_ctx = 0;
         out_filter_ctx = 0;
-        avfilter_register_all();
+        // avfilter_register_all();
 #endif //QTAV_HAVE(AVFILTER)
     }
     ~Private() {
@@ -204,7 +204,7 @@ QString LibAVFilter::filterDescription(const QString &filterName)
 {
     QString s;
 #if QTAV_HAVE(AVFILTER)
-    avfilter_register_all();
+    // avfilter_register_all();
     const AVFilter *f = avfilter_get_by_name(filterName.toUtf8().constData());
     if (!f)
         return s;
@@ -282,28 +282,27 @@ void* LibAVFilter::pullFrameHolder()
 QStringList LibAVFilter::registeredFilters(int type)
 {
     QStringList filters;
+
 #if QTAV_HAVE(AVFILTER)
-    avfilter_register_all();
-    const AVFilter* f = NULL;
-    AVFilterPad* fp = NULL; // no const in avfilter_pad_get_name() for ffmpeg<=1.2 libav<=9
-#if AV_MODULE_CHECK(LIBAVFILTER, 3, 8, 0, 53, 100)
-    while ((f = avfilter_next(f))) {
-#else
-    AVFilter** ff = NULL;
-    while ((ff = av_filter_next(ff)) && *ff) {
-        f = (*ff);
-#endif
-        fp = (AVFilterPad*)f->inputs;
-        // only check the 1st pad
-        if (!fp || !avfilter_pad_get_name(fp, 0) || avfilter_pad_get_type(fp, 0) != (AVMediaType)type)
+    void *opaque = nullptr;
+    const AVFilter *f = nullptr;
+
+    // 遍历所有注册的过滤器
+    while ((f = av_filter_iterate(&opaque))) {
+        const AVFilterPad *input_pad = avfilter_pad_get_name(f->inputs, 0) ? f->inputs : nullptr;
+        const AVFilterPad *output_pad = avfilter_pad_get_name(f->outputs, 0) ? f->outputs : nullptr;
+
+        // 检查输入和输出 pad 的类型是否匹配
+        if (!input_pad || avfilter_pad_get_type(input_pad, 0) != (AVMediaType)type)
             continue;
-        fp = (AVFilterPad*)f->outputs;
-        // only check the 1st pad
-        if (!fp || !avfilter_pad_get_name(fp, 0) || avfilter_pad_get_type(fp, 0) != (AVMediaType)type)
+        if (!output_pad || avfilter_pad_get_type(output_pad, 0) != (AVMediaType)type)
             continue;
+
+        // 添加过滤器名称到列表
         filters.append(QLatin1String(f->name));
     }
-#endif //QTAV_HAVE(AVFILTER)
+#endif // QTAV_HAVE(AVFILTER)
+
     return filters;
 }
 

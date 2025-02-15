@@ -54,7 +54,7 @@ public:
     AudioEncoderFFmpegPrivate()
         : AudioEncoderPrivate()
     {
-        avcodec_register_all();
+        // avcodec_register_all();
         // NULL: codec-specific defaults won't be initialized, which may result in suboptimal default settings (this is important mainly for encoders, e.g. libx264).
         avctx = avcodec_alloc_context3(NULL);
     }
@@ -68,11 +68,11 @@ bool AudioEncoderFFmpegPrivate::open()
 {
     if (codec_name.isEmpty()) {
         // copy ctx from muxer by copyAVCodecContext
-        AVCodec *codec = avcodec_find_encoder(avctx->codec_id);
+        const AVCodec *codec = avcodec_find_encoder(avctx->codec_id);
         AV_ENSURE_OK(avcodec_open2(avctx, codec, &dict), false);
         return true;
     }
-    AVCodec *codec = avcodec_find_encoder_by_name(codec_name.toUtf8().constData());
+    const AVCodec *codec = avcodec_find_encoder_by_name(codec_name.toUtf8().constData());
     if (!codec) {
         const AVCodecDescriptor* cd = avcodec_descriptor_get_by_name(codec_name.toUtf8().constData());
         if (cd) {
@@ -177,49 +177,79 @@ AudioEncoderId AudioEncoderFFmpeg::id() const
 bool AudioEncoderFFmpeg::encode(const AudioFrame &frame)
 {
     DPTR_D(AudioEncoderFFmpeg);
-    AVFrame *f = NULL;
+
+    AVFrame *f = nullptr;
     if (frame.isValid()) {
         f = av_frame_alloc();
+        if (!f) {
+            qWarning("Failed to allocate AVFrame");
+            return false;
+        }
+
         const AudioFormat fmt(frame.format());
         f->format = fmt.sampleFormatFFmpeg();
         f->channel_layout = fmt.channelLayoutFFmpeg();
-        // f->channels = fmt.channels(); //remove? not availale in libav9
-        // must be (not the last frame) exactly frame_size unless CODEC_CAP_VARIABLE_FRAME_SIZE is set (frame_size==0)
-        // TODO: mpv use pcmhack for avctx.frame_size==0. can we use input frame.samplesPerChannel?
         f->nb_samples = d.frame_size;
-        /// f->quality = d.avctx->global_quality; //TODO
-        // TODO: record last pts. mpv compute pts internally and also use playback time
-        f->pts = int64_t(frame.timestamp()*fmt.sampleRate()); // TODO
-        // pts is set in muxer
+        f->pts = int64_t(frame.timestamp() * fmt.sampleRate()); // 设置 PTS
+
         const int nb_planes = frame.planeCount();
-        // bytes between 2 samples on a plane. TODO: add to AudioFormat? what about bytesPerFrame?
-        const int sample_stride = fmt.isPlanar() ? fmt.bytesPerSample() : fmt.bytesPerSample()*fmt.channels();
+        const int sample_stride = fmt.isPlanar() ? fmt.bytesPerSample() : fmt.bytesPerSample() * fmt.channels();
         for (int i = 0; i < nb_planes; ++i) {
-            f->linesize[i] = f->nb_samples * sample_stride;// frame.bytesPerLine(i); //
+            f->linesize[i] = f->nb_samples * sample_stride;
             f->extended_data[i] = (uint8_t*)frame.constBits(i);
         }
+
+        // 设置帧的采样率和通道布局
+        f->sample_rate = fmt.sampleRate();
+        f->channels = fmt.channels();
     }
+
     AVPacket pkt;
     av_init_packet(&pkt);
-    pkt.data = (uint8_t*)d.buffer.constData(); //NULL
-    pkt.size = d.buffer.size(); //0
-    int got_packet = 0;
-    int ret = avcodec_encode_audio2(d.avctx, &pkt, f, &got_packet);
-    av_frame_free(&f);
-    if (ret < 0) {
-        //qWarning("error avcodec_encode_audio2: %s" ,av_err2str(ret));
-        //av_packet_unref(&pkt); //FIXME
-        return false; //false
+    pkt.data = nullptr;
+    pkt.size = 0;
+
+    int ret = 0;
+
+    // 发送帧到编码器
+    if (f) {
+        ret = avcodec_send_frame(d.avctx, f);
+        if (ret < 0) {
+            qWarning("Error sending frame to encoder: %s", av_err2str(ret));
+            av_frame_free(&f);
+            return false;
+        }
+    } else {
+        // 发送 NULL 帧表示 EOF
+        ret = avcodec_send_frame(d.avctx, nullptr);
+        if (ret < 0) {
+            qWarning("Error sending EOF frame to encoder: %s", av_err2str(ret));
+            return false;
+        }
     }
-    if (!got_packet) {
-        qWarning("no packet got");
+
+    // 接收编码后的数据包
+    ret = avcodec_receive_packet(d.avctx, &pkt);
+    if (ret == AVERROR(EAGAIN)) {
+        // 需要更多帧
+        qWarning("Encoder needs more frames");
         d.packet = Packet();
-        // invalid frame means eof
         return frame.isValid();
+    } else if (ret == AVERROR_EOF) {
+        // 编码结束
+        qWarning("Encoder reached EOF");
+        d.packet = Packet();
+        return false;
+    } else if (ret < 0) {
+        qWarning("Error receiving packet from encoder: %s", av_err2str(ret));
+        return false;
     }
-   // qDebug("enc avpkt.pts: %lld, dts: %lld.", pkt.pts, pkt.dts);
+
+    // 成功编码一个数据包
     d.packet = Packet::fromAVPacket(&pkt, av_q2d(d.avctx->time_base));
-   // qDebug("enc packet.pts: %.3f, dts: %.3f.", d.packet.pts, d.packet.dts);
+    av_packet_unref(&pkt); // 释放数据包
+
+    av_frame_free(&f); // 释放帧
     return true;
 }
 

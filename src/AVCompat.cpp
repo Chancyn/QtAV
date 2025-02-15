@@ -246,7 +246,7 @@ int av_samples_copy(uint8_t **dst, uint8_t * const *src, int dst_offset,
 const char *avcodec_get_name(enum AVCodecID id)
 {
     const AVCodecDescriptor *cd;
-    AVCodec *codec;
+    const AVCodec *codec;
 
     if (id == AV_CODEC_ID_NONE)
         return "none";
@@ -391,7 +391,7 @@ const char *get_codec_long_name(enum AVCodecID id)
     if (cd)
         return cd->long_name;
     av_log(NULL, AV_LOG_WARNING, "Codec 0x%x is not in the full list.\n", id);
-    AVCodec *codec = avcodec_find_decoder(id);
+    const AVCodec *codec = avcodec_find_decoder(id);
     if (codec)
         return codec->long_name;
     codec = avcodec_find_encoder(id);

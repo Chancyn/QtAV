@@ -27,7 +27,7 @@
 
 namespace QtAV {
 
-static AVCodec* get_codec(const QString &name, const QString& hwa, AVCodecID cid)
+static const AVCodec* get_codec(const QString &name, const QString& hwa, AVCodecID cid)
 {
     QString fullname(name);
     if (name.isEmpty()) {
@@ -35,7 +35,7 @@ static AVCodec* get_codec(const QString &name, const QString& hwa, AVCodecID cid
             return avcodec_find_decoder(cid);
         fullname = QString("%1_%2").arg(avcodec_get_name(cid)).arg(hwa);
     }
-    AVCodec *codec = avcodec_find_decoder_by_name(fullname.toUtf8().constData());
+    const AVCodec *codec = avcodec_find_decoder_by_name(fullname.toUtf8().constData());
     if (codec)
         return codec;
     const AVCodecDescriptor* cd = avcodec_descriptor_get_by_name(fullname.toUtf8().constData());
@@ -76,7 +76,7 @@ bool AVDecoder::open()
         return false;
     }
     const QString hwa = property("hwaccel").toString();
-    AVCodec* codec = get_codec(codecName(), hwa, d.codec_ctx->codec_id);
+    const AVCodec* codec = get_codec(codecName(), hwa, d.codec_ctx->codec_id);
     if (!codec) { // TODO: can be null for none-ffmpeg based decoders
         QString es(tr("No codec could be found for '%1'"));
         if (d.codec_name.isEmpty()) {
@@ -180,7 +180,32 @@ void AVDecoder::setCodecContext(void *codecCtx)
         qWarning("avcodec_alloc_context3 failed");
         return;
     }
-    AV_ENSURE_OK(avcodec_copy_context(d.codec_ctx, ctx));
+
+    AVCodecParameters *src_params = avcodec_parameters_alloc();
+    if (!src_params) {
+        qWarning("Failed to allocate AVCodecParameters");
+        return;
+    }
+
+    // 从源上下文获取参数
+    int ret = avcodec_parameters_from_context(src_params, ctx);
+    if (ret < 0) {
+        qWarning("Failed to copy parameters from context: %s", av_err2str(ret));
+        avcodec_parameters_free(&src_params);
+        return;
+    }
+
+    // 将参数复制到目标上下文
+    ret = avcodec_parameters_to_context(d.codec_ctx, src_params);
+    if (ret < 0) {
+        qWarning("Failed to copy parameters to context: %s", av_err2str(ret));
+        avcodec_parameters_free(&src_params);
+        return;
+    }
+
+    // 释放临时参数
+    avcodec_parameters_free(&src_params);
+    return;
 }
 
 //TODO: reset other parameters?

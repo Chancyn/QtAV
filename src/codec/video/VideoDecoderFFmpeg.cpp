@@ -83,9 +83,9 @@ public:
     // flags. visualize motion vectors (MVs)
     enum MotionVectorVisFlag {
         No = 0, //default
-        PF = FF_DEBUG_VIS_MV_P_FOR,
-        BF = FF_DEBUG_VIS_MV_B_FOR,
-        BB = FF_DEBUG_VIS_MV_B_BACK
+        // PF = FF_DEBUG_VIS_MV_P_FOR,
+        // BF = FF_DEBUG_VIS_MV_B_FOR,
+        // BB = FF_DEBUG_VIS_MV_B_BACK
     };
     Q_DECLARE_FLAGS(MotionVectorVisFlags, MotionVectorVisFlag)
     enum BugFlag {

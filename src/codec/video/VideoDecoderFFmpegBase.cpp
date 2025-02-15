@@ -30,11 +30,12 @@ extern ColorRange colorRangeFromFFmpeg(AVColorRange cr);
 
 static void SetColorDetailsByFFmpeg(VideoFrame *f, AVFrame* frame, AVCodecContext* codec_ctx)
 {
-    ColorSpace cs = colorSpaceFromFFmpeg(av_frame_get_colorspace(frame));
+    // ColorSpace cs = colorSpaceFromFFmpeg(av_frame_get_colorspace(frame));
+    ColorSpace cs = colorSpaceFromFFmpeg(frame->colorspace);
     if (cs == ColorSpace_Unknown)
         cs = colorSpaceFromFFmpeg(codec_ctx->colorspace);
     f->setColorSpace(cs);
-    ColorRange cr = colorRangeFromFFmpeg(av_frame_get_color_range(frame));
+    ColorRange cr = colorRangeFromFFmpeg(frame->color_range);
     if (cr == ColorRange_Unknown) {
         // check yuvj format. TODO: deprecated, check only for old ffmpeg?
         const AVPixelFormat pixfmt = (AVPixelFormat)frame->format;
@@ -115,36 +116,42 @@ bool VideoDecoderFFmpegBase::decode(const Packet &packet)
 {
     if (!isAvailable())
         return false;
+
     DPTR_D(VideoDecoderFFmpegBase);
-    // some decoders might need other fields like flags&AV_PKT_FLAG_KEY
-    // const AVPacket*: ffmpeg >= 1.0. no libav
-    int got_frame_ptr = 0;
+
     int ret = 0;
+
     if (packet.isEOF()) {
-        AVPacket eofpkt;
-        av_init_packet(&eofpkt);
-        eofpkt.data = NULL;
-        eofpkt.size = 0;
-        ret = avcodec_decode_video2(d.codec_ctx, d.frame, &got_frame_ptr, &eofpkt);
+        // Send a flush packet to the decoder
+        ret = avcodec_send_packet(d.codec_ctx, nullptr);
     } else {
-        ret = avcodec_decode_video2(d.codec_ctx, d.frame, &got_frame_ptr, (AVPacket*)packet.asAVPacket());
+        // Send the packet to the decoder
+        ret = avcodec_send_packet(d.codec_ctx, (AVPacket*)packet.asAVPacket());
     }
-    //qDebug("pic_type=%c", av_get_picture_type_char(d.frame->pict_type));
-    d.undecoded_size = qMin(packet.data.size() - ret, packet.data.size());
+
     if (ret < 0) {
-        //qWarning("[VideoDecoderFFmpegBase] %s", av_err2str(ret));
+        qWarning("[VideoDecoderFFmpegBase] Error sending a packet for decoding: %s", av_err2str(ret));
         return false;
     }
-    if (!got_frame_ptr) {
-        qWarning("no frame could be decompressed: %s %d/%d", av_err2str(ret), d.undecoded_size, packet.data.size());
+
+    // Receive the decoded frame
+    ret = avcodec_receive_frame(d.codec_ctx, d.frame);
+    if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+        // No frame is available at this moment, or the decoder has been fully flushed
         return !packet.isEOF();
+    } else if (ret < 0) {
+        qWarning("[VideoDecoderFFmpegBase] Error during decoding: %s", av_err2str(ret));
+        return false;
     }
+
+    // Check if the frame dimensions are valid
     if (!d.codec_ctx->width || !d.codec_ctx->height)
         return false;
-    //qDebug("codec %dx%d, frame %dx%d", d.codec_ctx->width, d.codec_ctx->height, d.frame->width, d.frame->height);
+
+    // Update the frame dimensions
     d.width = d.frame->width; // TODO: remove? used in hwdec
     d.height = d.frame->height;
-    //avcodec_align_dimensions2(d.codec_ctx, &d.width_align, &d.height_align, aligns);
+
     return true;
 }
 
@@ -159,7 +166,7 @@ VideoFrame VideoDecoderFFmpegBase::frame()
     frame.setBits(d.frame->data);
     frame.setBytesPerLine(d.frame->linesize);
     // in s. TODO: what about AVFrame.pts? av_frame_get_best_effort_timestamp? move to VideoFrame::from(AVFrame*)
-    frame.setTimestamp((double)d.frame->pkt_pts/1000.0);
+    frame.setTimestamp((double)d.frame->best_effort_timestamp/1000.0);
     frame.setMetaData(QStringLiteral("avbuf"), QVariant::fromValue(AVFrameBuffersRef(new AVFrameBuffers(d.frame))));
     d.updateColorDetails(&frame);
     if (frame.format().hasPalette()) {

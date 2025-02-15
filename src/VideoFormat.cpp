@@ -700,9 +700,17 @@ bool VideoFormat::hasPalette() const
     return (d->flags() & AV_PIX_FMT_FLAG_PAL) == AV_PIX_FMT_FLAG_PAL;
 }
 
+// bool VideoFormat::isPseudoPaletted() const
+// {
+//     const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(d->pixelFormat());
+//     if (!desc)
+//         return false;
+//     return (desc->flags & AV_PIX_FMT_FLAG_PAL) == AV_PIX_FMT_FLAG_PAL;
+// }
+
 bool VideoFormat::isPseudoPaletted() const
 {
-    return (d->flags() & AV_PIX_FMT_FLAG_PSEUDOPAL) == AV_PIX_FMT_FLAG_PSEUDOPAL;
+    return (d->flags() & AV_PIX_FMT_FLAG_PAL) == AV_PIX_FMT_FLAG_PAL;
 }
 
 bool VideoFormat::isBitStream() const

@@ -87,47 +87,77 @@ AudioDecoderFFmpeg::AudioDecoderFFmpeg()
 {
 }
 
+
 bool AudioDecoderFFmpeg::decode(const Packet &packet)
 {
     if (!isAvailable())
         return false;
+
     DPTR_D(AudioDecoderFFmpeg);
     d.decoded.clear();
     int got_frame_ptr = 0;
     int ret = 0;
+
+    // 处理 EOF 数据包
     if (packet.isEOF()) {
         AVPacket eofpkt;
         av_init_packet(&eofpkt);
         eofpkt.data = NULL;
         eofpkt.size = 0;
-        ret = avcodec_decode_audio4(d.codec_ctx, d.frame, &got_frame_ptr, &eofpkt);
+
+        // 发送 EOF 数据包
+        ret = avcodec_send_packet(d.codec_ctx, &eofpkt);
+        if (ret < 0) {
+            qWarning("[AudioDecoder] Error sending EOF packet: %s", av_err2str(ret));
+            return false;
+        }
     } else {
-    // const AVPacket*: ffmpeg >= 1.0. no libav
-        ret = avcodec_decode_audio4(d.codec_ctx, d.frame, &got_frame_ptr, (AVPacket*)packet.asAVPacket());
+        // 发送普通数据包
+        ret = avcodec_send_packet(d.codec_ctx, (AVPacket*)packet.asAVPacket());
+        if (ret < 0) {
+            qWarning("[AudioDecoder] Error sending packet: %s", av_err2str(ret));
+            return false;
+        }
     }
-    d.undecoded_size = qMin(packet.data.size() - ret, packet.data.size());
+
+    // 接收解码后的帧
+    ret = avcodec_receive_frame(d.codec_ctx, d.frame);
     if (ret == AVERROR(EAGAIN)) {
+        // 需要更多数据
+        return false;
+    } else if (ret == AVERROR_EOF) {
+        // 解码结束
+        return false;
+    } else if (ret < 0) {
+        qWarning("[AudioDecoder] Error receiving frame: %s", av_err2str(ret));
         return false;
     }
-    if (ret < 0) {
-        qWarning("[AudioDecoder] %s", av_err2str(ret));
-        return false;
-    }
+
+    // 成功解码一帧
+    got_frame_ptr = 1;
+
+    // 计算未解码数据大小
+    d.undecoded_size = qMin(packet.data.size() - ret, packet.data.size());
+
     if (!got_frame_ptr) {
         qWarning("[AudioDecoder] got_frame_ptr=false. decoded: %d, un: %d %s", ret, d.undecoded_size, av_err2str(ret));
         return !packet.isEOF();
     }
+
 #if USE_AUDIO_FRAME
     return true;
 #endif
+
+    // 使用音频重采样器
     d.resampler->setInSampesPerChannel(d.frame->nb_samples);
     if (!d.resampler->convert((const quint8**)d.frame->extended_data)) {
         return false;
     }
+
     d.decoded = d.resampler->outData();
-    return true;
     return !d.decoded.isEmpty();
 }
+
 
 AudioFrame AudioDecoderFFmpeg::frame()
 {
@@ -145,7 +175,7 @@ AudioFrame AudioDecoderFFmpeg::frame()
     f.setBytesPerLine(d.frame->linesize[0], 0); // for correct alignment
     f.setSamplesPerChannel(d.frame->nb_samples);
     // TODO: ffplay check AVFrame.pts, pkt_pts, last_pts+nb_samples. move to AudioFrame::from(AVFrame*)
-    f.setTimestamp((double)d.frame->pkt_pts/1000.0);
+    f.setTimestamp((double)d.frame->best_effort_timestamp/1000.0);
     f.setAudioResampler(d.resampler); // TODO: remove. it's not safe if frame is shared. use a pool or detach if ref >1
     return f;
 }

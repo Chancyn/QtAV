@@ -138,17 +138,40 @@ void* AVEncoder::codecContext() const
     return d_func().avctx;
 }
 
-void AVEncoder::copyAVCodecContext(void* ctx)
-{
+void AVEncoder::copyAVCodecContext(void* ctx) {
     if (!ctx)
         return;
-    DPTR_D(AVEncoder);
-    AVCodecContext* c = static_cast<AVCodecContext*>(ctx);
+
+    DPTR_D(AVEncoder); // 假设这是你的类成员，用于访问私有数据
+    AVCodecContext* src_ctx = static_cast<AVCodecContext*>(ctx);
+
     if (d.avctx) {
-        // dest should be avcodec_alloc_context3(NULL)
-        AV_ENSURE_OK(avcodec_copy_context(d.avctx, c));
-        d.is_open = false;
-        return;
+        AVCodecParameters *src_params = avcodec_parameters_alloc();
+        if (!src_params) {
+            qWarning("Failed to allocate AVCodecParameters");
+            return;
+        }
+
+        // 从源上下文获取参数
+        int ret = avcodec_parameters_from_context(src_params, src_ctx);
+        if (ret < 0) {
+            qWarning("Failed to copy parameters from context: %s", av_err2str(ret));
+            avcodec_parameters_free(&src_params);
+            return;
+        }
+
+        // 将参数复制到目标上下文
+        ret = avcodec_parameters_to_context(d.avctx, src_params);
+        if (ret < 0) {
+            qWarning("Failed to copy parameters to context: %s", av_err2str(ret));
+            avcodec_parameters_free(&src_params);
+            return;
+        }
+
+        // 释放临时参数
+        avcodec_parameters_free(&src_params);
+
+        d.is_open = false; // 标记为未打开
     }
 }
 

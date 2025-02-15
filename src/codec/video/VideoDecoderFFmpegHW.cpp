@@ -84,7 +84,7 @@ static int ffmpeg_get_va_buffer(struct AVCodecContext *c, AVFrame *ff)//vlc_va_t
     //ff->reordered_opaque = c->reordered_opaque; //TODO: dxva?
     ff->opaque = 0;
 #if !AV_MODULE_CHECK(LIBAVCODEC, 54, 34, 0, 79, 101)
-    ff->pkt_pts = c->pkt ? c->pkt->pts : AV_NOPTS_VALUE;
+    ff->best_effort_timestamp = c->pkt ? c->pkt->pts : AV_NOPTS_VALUE;
 #endif
 #if LIBAVCODEC_VERSION_MAJOR < 54
     ff->age = 256*256*256*64;
@@ -113,7 +113,7 @@ static void ffmpeg_release_va_buffer(struct AVCodecContext *c, AVFrame *ff)
 bool VideoDecoderFFmpegHWPrivate::prepare()
 {
     //// From vlc begin
-    codec_ctx->thread_safe_callbacks = true; //?
+    // codec_ctx->thread_safe_callbacks = true; //?
     codec_ctx->thread_count = threads;
 #ifdef _MSC_VER
 #pragma warning(disable:4065) //vc: switch has default but no case
@@ -328,7 +328,7 @@ VideoFrame VideoDecoderFFmpegHW::copyToFrame(const VideoFormat& fmt, int surface
         // TODO: buffer pool and create VideoFrame when needed to avoid copy? also for other va
         frame = frame.clone();
     }
-    frame.setTimestamp(double(d.frame->pkt_pts)/1000.0);
+    frame.setTimestamp(double(d.frame->best_effort_timestamp)/1000.0);
     frame.setDisplayAspectRatio(d.getDAR(d.frame));
     d.updateColorDetails(&frame);
     return frame;

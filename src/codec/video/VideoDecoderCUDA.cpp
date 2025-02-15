@@ -45,7 +45,13 @@
 #include "cuda/cuda_api.h"
 #include "utils/Logger.h"
 #include "SurfaceInteropCUDA.h"
-
+extern "C"
+{
+    #include <libavformat/avformat.h>
+    #include <libavcodec/avcodec.h>
+    #include <libavutil/opt.h>
+    #include <libavcodec/bsf.h>
+}
 //decode error if not floating context
 
 namespace QtAV {
@@ -164,7 +170,7 @@ public:
         can_load = dllapi::testLoad("nvcuvid");
 #endif //QTAV_HAVE(DLLAPI_CUDA)
         available = false;
-        bsf = 0;
+        bsf_ctx = 0;
         cuctx = 0;
         cudev = 0;
         dec = 0;
@@ -183,8 +189,9 @@ public:
         interop_res = cuda::InteropResourcePtr();
     }
     ~VideoDecoderCUDAPrivate() {
-        if (bsf)
-            av_bitstream_filter_close(bsf);
+        if (bsf_ctx) {
+            av_bsf_free(&bsf_ctx);
+        }
         if (!can_load)
             return;
         if (!isLoaded()) //cuda_api
@@ -320,7 +327,7 @@ public:
     int nb_dec_surface;
     QString description;
 
-    AVBitStreamFilterContext *bsf; //TODO: rename bsf_ctx
+    AVBSFContext *bsf_ctx; //TODO: rename bsf_ctx
 
     VideoDecoderCUDA::CopyMode copy_mode;
     cuda::InteropResourcePtr interop_res; //may be still used in video frames when decoder is destroyed
@@ -373,11 +380,14 @@ bool VideoDecoderCUDA::decode(const Packet &packet)
 {
     if (!isAvailable())
         return false;
+
     DPTR_D(VideoDecoderCUDA);
     if (!d.parser) {
         qWarning("CUVID parser not ready");
         return false;
     }
+
+    // 处理 EOF 包
     if (packet.isEOF()) {
         if (!d.flushParser()) {
             qDebug("Error decode EOS"); // when?
@@ -385,40 +395,61 @@ bool VideoDecoderCUDA::decode(const Packet &packet)
         }
         return !d.frame_queue.isEmpty();
     }
-    uint8_t *outBuf = 0;
+
+    uint8_t *outBuf = nullptr;
     int outBufSize = 0;
-    int filtered = 0;
-    if (d.bsf) {
-        // h264_mp4toannexb_filter does not use last parameter 'keyFrame', so just set 0
-        //return: 0: not changed, no outBuf allocated. >0: ok. <0: fail
-        filtered = av_bitstream_filter_filter(d.bsf, d.codec_ctx, NULL, &outBuf, &outBufSize
-                                                  , (const uint8_t*)packet.data.constData(), packet.data.size()
-                                                  , 0);//d.is_keyframe);
-        //qDebug("%s @%d filtered=%d outBuf=%p, outBufSize=%d", __FUNCTION__, __LINE__, filtered, outBuf, outBufSize);
-        if (filtered < 0) {
-            qDebug("failed to filter: %s", av_err2str(filtered));
+    AVPacket filtered_pkt;
+    av_init_packet(&filtered_pkt);
+    filtered_pkt.data = nullptr;
+    filtered_pkt.size = 0;
+
+    if (d.bsf_ctx) {
+        // 将输入数据包复制到 AVPacket
+        AVPacket input_pkt;
+        av_init_packet(&input_pkt);
+        input_pkt.data = (uint8_t*)packet.data.constData();
+        input_pkt.size = packet.data.size();
+        input_pkt.pts = packet.pts >= 0.0 ? static_cast<int64_t>(packet.pts * 1000.0) : AV_NOPTS_VALUE;
+
+        // 发送数据包到比特流过滤器
+        if (av_bsf_send_packet(d.bsf_ctx, &input_pkt) < 0) {
+            qDebug("Failed to send packet to bitstream filter");
+            return false;
         }
+
+        // 接收过滤后的数据包
+        if (av_bsf_receive_packet(d.bsf_ctx, &filtered_pkt) < 0) {
+            qDebug("Failed to receive packet from bitstream filter");
+            return false;
+        }
+
+        outBuf = filtered_pkt.data;
+        outBufSize = filtered_pkt.size;
     } else {
         outBuf = (uint8_t*)packet.data.constData();
         outBufSize = packet.data.size();
     }
 
+    // 准备 CUVID 数据包
     CUVIDSOURCEDATAPACKET cuvid_pkt;
     memset(&cuvid_pkt, 0, sizeof(CUVIDSOURCEDATAPACKET));
-    cuvid_pkt.payload = outBuf;// (unsigned char *)packet.data.constData();
-    cuvid_pkt.payload_size = outBufSize; //packet.data.size();
-    // TODO: other flags
+    cuvid_pkt.payload = outBuf;
+    cuvid_pkt.payload_size = outBufSize;
+
     if (packet.pts >= 0.0) {
         cuvid_pkt.flags = CUVID_PKT_TIMESTAMP;
         cuvid_pkt.timestamp = packet.pts * 1000.0; // TODO: 10MHz?
     }
-    //TODO: fill NALU header for h264? https://devtalk.nvidia.com/default/topic/515571/what-the-data-format-34-cuvidparsevideodata-34-can-accept-/
+
+    // 解析视频数据
     d.doParseVideoData(&cuvid_pkt);
-    if (filtered > 0) {
-        av_freep(&outBuf);
+
+    // 释放过滤后的数据包
+    if (d.bsf_ctx && filtered_pkt.data) {
+        av_packet_unref(&filtered_pkt);
     }
-    // callbacks are in the same thread as this. so no queue is required?
-    //qDebug("frame queue size on decode: %d", d.frame_queue.size());
+
+    // 检查帧队列是否为空
     return !d.frame_queue.isEmpty();
     // video thread: if dec.hasFrame() keep pkt for the next loop and not decode, direct display the frame
 }
@@ -776,20 +807,31 @@ bool VideoDecoderCUDAPrivate::processDecodedData(CUVIDPARSERDISPINFO *cuviddisp,
     return true;
 }
 
-void VideoDecoderCUDAPrivate::setBSF(AVCodecID codec)
-{
+void VideoDecoderCUDAPrivate::setBSF(AVCodecID codec) {
     if (codec == QTAV_CODEC_ID(H264)) {
-        if (!bsf)
-            bsf = av_bitstream_filter_init("h264_mp4toannexb");
-        Q_ASSERT(bsf && "h264_mp4toannexb bsf not found");
+        if (!bsf_ctx) {
+            const AVBitStreamFilter *bsf_filter = av_bsf_get_by_name("h264_mp4toannexb");
+            if (!bsf_filter) {
+                qWarning() << "h264_mp4toannexb bsf not found";
+                return;
+            }
+            av_bsf_alloc(bsf_filter, &bsf_ctx);
+        }
+        Q_ASSERT(bsf_ctx && "h264_mp4toannexb bsf not found");
     } else if (codec == QTAV_CODEC_ID(HEVC)) {
-        if (!bsf)
-            bsf = av_bitstream_filter_init("hevc_mp4toannexb");
-        Q_ASSERT(bsf && "hevc_mp4toannexb bsf not found");
+        if (!bsf_ctx) {
+            const AVBitStreamFilter *bsf_filter = av_bsf_get_by_name("hevc_mp4toannexb");
+            if (!bsf_filter) {
+                qWarning() << "hevc_mp4toannexb bsf not found";
+                return;
+            }
+            av_bsf_alloc(bsf_filter, &bsf_ctx);
+        }
+        Q_ASSERT(bsf_ctx && "hevc_mp4toannexb bsf not found");
     } else {
-        if (bsf) {
-            av_bitstream_filter_close(bsf);
-            bsf = 0;
+        if (bsf_ctx) {
+            av_bsf_free(&bsf_ctx);
+            bsf_ctx = nullptr;
         }
     }
 }

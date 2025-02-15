@@ -116,11 +116,11 @@ bool VideoEncoderFFmpegPrivate::open()
     nb_encoded = 0LL;
     if (codec_name.isEmpty()) {
         // copy ctx from muxer by copyAVCodecContext
-        AVCodec *codec = avcodec_find_encoder(avctx->codec_id);
+        const AVCodec *codec = avcodec_find_encoder(avctx->codec_id);
         AV_ENSURE_OK(avcodec_open2(avctx, codec, &dict), false);
         return true;
     }
-    AVCodec *codec = avcodec_find_encoder_by_name(codec_name.toUtf8().constData());
+    const AVCodec *codec = avcodec_find_encoder_by_name(codec_name.toUtf8().constData());
     if (!codec) {
         const AVCodecDescriptor* cd = avcodec_descriptor_get_by_name(codec_name.toUtf8().constData());
         if (cd) {
@@ -247,7 +247,7 @@ bool VideoEncoderFFmpegPrivate::open()
     applyOptionsForContext();
     AV_ENSURE_OK(avcodec_open2(avctx, codec, &dict), false);
     // from mpv ao_lavc
-    const int buffer_size = qMax<int>(qMax<int>(width*height*6+200, AV_INPUT_BUFFER_MIN_SIZE), sizeof(AVPicture));//??
+    const int buffer_size = qMax<int>(qMax<int>(width*height*6+200, AV_INPUT_BUFFER_MIN_SIZE), sizeof(AVFrame));//??
     buffer.resize(buffer_size);
     return true;
 }
@@ -294,60 +294,71 @@ bool VideoEncoderFFmpeg::encode(const VideoFrame &frame)
 {
     DPTR_D(VideoEncoderFFmpeg);
     QScopedPointer<AVFrame, ScopedAVFrameDeleter> f;
-    // hwupload
+
+    // 设置帧的像素格式
     AVPixelFormat pixfmt = AVPixelFormat(frame.pixelFormatFFmpeg());
+
     if (frame.isValid()) {
         f.reset(av_frame_alloc());
+        if (!f) {
+            qWarning("Failed to allocate AVFrame");
+            return false;
+        }
+
         f->format = pixfmt;
         f->width = frame.width();
         f->height = frame.height();
-//        f->quality = d.avctx->global_quality;
+
+        // 设置时间戳
         switch (timestampMode()) {
         case TimestampCopy:
-            f->pts = int64_t(frame.timestamp()*frameRate()); // TODO: check monotically increase and fix if not. or another mode?
+            f->pts = int64_t(frame.timestamp() * frameRate()); // 根据时间戳模式设置 PTS
             break;
         case TimestampMonotonic:
-            f->pts = d.nb_encoded+1;
+            f->pts = d.nb_encoded + 1; // 使用单调递增的 PTS
             break;
         default:
             break;
         }
 
-        // pts is set in muxer
+        // 设置帧的数据
         const int nb_planes = frame.planeCount();
         for (int i = 0; i < nb_planes; ++i) {
             f->linesize[i] = frame.bytesPerLine(i);
             f->data[i] = (uint8_t*)frame.constBits(i);
         }
+
+        // 设置编码器的宽度和高度
         if (d.avctx->width <= 0) {
             d.avctx->width = frame.width();
         }
         if (d.avctx->height <= 0) {
-            d.avctx->height = frame.width();
+            d.avctx->height = frame.height();
         }
+
 #ifdef HAVE_AVHWCTX
+        // 处理硬件加速帧
         if (d.avctx->hw_frames_ctx) {
-            // TODO: try to map to SourceSurface
-            // checl valid sw_formats
             if (!d.hwframes_ref) {
-                qWarning("no hw frame context for uploading");
+                qWarning("No hw frame context for uploading");
                 return false;
             }
+
             if (pixfmt != d.hwframes->sw_format) {
-                // reinit or got an unsupported format. assume parameters will not change, so it's  the 1st init
-                // check constraints
+                // 重新初始化或处理不支持的格式
                 bool init_frames_ctx = d.hwframes->sw_format == AVPixelFormat(-1);
-                if (d.sw_fmts.contains(pixfmt)) { // format changed
+                if (d.sw_fmts.contains(pixfmt)) {
                     init_frames_ctx = true;
-                } else { // convert to supported sw format
+                } else {
                     pixfmt = d.sw_fmts[0];
                     f->format = pixfmt;
                     VideoFrame converted = frame.to(VideoFormat::pixelFormatFromFFmpeg(pixfmt));
                     for (int i = 0; i < converted.planeCount(); ++i) {
                         f->linesize[i] = converted.bytesPerLine(i);
-                        f->data[i] = (uint8_t*)frame.constBits(i);
+                        f->data[i] = (uint8_t*)converted.constBits(i);
                     }
                 }
+
                 if (init_frames_ctx) {
                     d.hwframes->sw_format = pixfmt;
                     d.hwframes->width = frame.width();
@@ -355,39 +366,64 @@ bool VideoEncoderFFmpeg::encode(const VideoFrame &frame)
                     AV_ENSURE(av_hwframe_ctx_init(d.hwframes_ref), false);
                 }
             }
-            // upload
-            QScopedPointer<AVFrame, ScopedAVFrameDeleter> hwf( av_frame_alloc());
+
+            // 上传帧到硬件
+            QScopedPointer<AVFrame, ScopedAVFrameDeleter> hwf(av_frame_alloc());
             AV_ENSURE(av_hwframe_get_buffer(d.hwframes_ref, hwf.data(), 0), false);
-            //hwf->format = d.hwframes->format; // not necessary
-            //hwf->width = f->width;
-            //hwf->height = f->height;
             AV_ENSURE(av_hwframe_transfer_data(hwf.data(), f.data(), 0), false);
             AV_ENSURE(av_frame_copy_props(hwf.data(), f.data()), false);
             av_frame_unref(f.data());
             av_frame_move_ref(f.data(), hwf.data());
         }
-#endif //HAVE_AVHWCTX
+#endif // HAVE_AVHWCTX
     }
+
+    // 初始化数据包
     AVPacket pkt;
     av_init_packet(&pkt);
-    pkt.data = (uint8_t*)d.buffer.constData();
-    pkt.size = d.buffer.size();
-    int got_packet = 0;
-    int ret = avcodec_encode_video2(d.avctx, &pkt, f.data(), &got_packet);
-    if (ret < 0) {
-        qWarning("error avcodec_encode_video2: %s" ,av_err2str(ret));
-        return false; //false
+    pkt.data = nullptr;
+    pkt.size = 0;
+
+    int ret = 0;
+
+    // 发送帧到编码器
+    if (f) {
+        ret = avcodec_send_frame(d.avctx, f.data());
+        if (ret < 0) {
+            qWarning("Error sending frame to encoder: %s", av_err2str(ret));
+            return false;
+        }
+    } else {
+        // 发送 NULL 帧表示 EOF
+        ret = avcodec_send_frame(d.avctx, nullptr);
+        if (ret < 0) {
+            qWarning("Error sending EOF frame to encoder: %s", av_err2str(ret));
+            return false;
+        }
     }
-    d.nb_encoded++;
-    if (!got_packet) {
-        qWarning("no packet got");
+
+    // 接收编码后的数据包
+    ret = avcodec_receive_packet(d.avctx, &pkt);
+    if (ret == AVERROR(EAGAIN)) {
+        // 需要更多帧
+        qWarning("Encoder needs more frames");
         d.packet = Packet();
-        // invalid frame means eof
         return frame.isValid();
+    } else if (ret == AVERROR_EOF) {
+        // 编码结束
+        qWarning("Encoder reached EOF");
+        d.packet = Packet();
+        return false;
+    } else if (ret < 0) {
+        qWarning("Error receiving packet from encoder: %s", av_err2str(ret));
+        return false;
     }
-   // qDebug("enc avpkt.pts: %lld, dts: %lld.", pkt.pts, pkt.dts);
+
+    // 成功编码一个数据包
+    d.nb_encoded++;
     d.packet = Packet::fromAVPacket(&pkt, av_q2d(d.avctx->time_base));
-   // qDebug("enc packet.pts: %.3f, dts: %.3f.", d.packet.pts, d.packet.dts);
+    av_packet_unref(&pkt); // 释放数据包
+
     return true;
 }
 
